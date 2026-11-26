@@ -235,13 +235,13 @@ async function fetchTimeout(url, opts, ms = 60000) {
   catch (e) { clearTimeout(t); if (e?.name === "AbortError") throw new Error("请求超时，接口长时间没有响应"); throw e; }
 }
 function uaH(entry, h) { if (entry && entry.ua) h["user-agent"] = entry.ua; return h; }
-async function tryChat(env, entry, model, system, history) {
-  const r = await fetchTimeout(`${normBase(entry.base_url)}/chat/completions`, { method: "POST", headers: uaH(entry, { "content-type": "application/json", authorization: `Bearer ${entry.key}` }), body: JSON.stringify({ model, messages: [{ role: "system", content: system }, ...history] }) });
+async function tryChat(env, entry, model, system, history, timeoutMs) {
+  const r = await fetchTimeout(`${normBase(entry.base_url)}/chat/completions`, { method: "POST", headers: uaH(entry, { "content-type": "application/json", authorization: `Bearer ${entry.key}` }), body: JSON.stringify({ model, messages: [{ role: "system", content: system }, ...history] }) }, timeoutMs || 60000);
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error?.message || `HTTP ${r.status}`);
   return data.choices?.[0]?.message?.content || "(empty reply)";
 }
-// Some providers disabled /chat/completions and require the Responses API.
+// Some providers (e.g. api.openai.com) disabled /chat/completions and require the Responses API.
 async function apiTypeFor(env, entry) {
   if (entry.api === "responses" || entry.api === "chat") return entry.api;
   return (await cacheGet(env, `apitype:${entry.base_url}`)) || "chat";
@@ -250,8 +250,8 @@ function toResponsesContent(content) {
   if (typeof content === "string") return content;
   return content.map(pt => pt.type === "image_url" ? { type: "input_image", image_url: pt.image_url?.url || "" } : { type: "input_text", text: pt.text || "" });
 }
-async function callResponses(entry, model, system, history) {
-  const r = await fetchTimeout(`${normBase(entry.base_url)}/responses`, { method: "POST", headers: uaH(entry, { "content-type": "application/json", authorization: `Bearer ${entry.key}` }), body: JSON.stringify({ model, instructions: system, input: history.map(m => ({ role: m.role, content: toResponsesContent(m.content) })) }) });
+async function callResponses(entry, model, system, history, timeoutMs) {
+  const r = await fetchTimeout(`${normBase(entry.base_url)}/responses`, { method: "POST", headers: uaH(entry, { "content-type": "application/json", authorization: `Bearer ${entry.key}` }), body: JSON.stringify({ model, instructions: system, input: history.map(m => ({ role: m.role, content: toResponsesContent(m.content) })) }) }, timeoutMs || 60000);
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error?.message || `HTTP ${r.status}`);
   let text = "";
@@ -260,13 +260,13 @@ async function callResponses(entry, model, system, history) {
   if (!text) throw new Error("Responses 接口返回为空");
   return text;
 }
-async function tryEntry(env, entry, model, system, history) {
+async function tryEntry(env, entry, model, system, history, timeoutMs) {
   const kind = await apiTypeFor(env, entry);
-  if (kind === "responses") return callResponses(entry, model, system, history);
-  try { return await tryChat(env, entry, model, system, history); }
+  if (kind === "responses") return callResponses(entry, model, system, history, timeoutMs);
+  try { return await tryChat(env, entry, model, system, history, timeoutMs); }
   catch (e) {
     if (/responses/i.test(e.message || "")) {
-      const out = await callResponses(entry, model, system, history);
+      const out = await callResponses(entry, model, system, history, timeoutMs);
       if (!(await kvGuardOn(env))) await cachePut(env, `apitype:${entry.base_url}`, "responses");
       return out;
     }
@@ -276,7 +276,6 @@ async function tryEntry(env, entry, model, system, history) {
 async function orderCandidates(env, opts) {
   const model = opts?.model || (await kvGet(env, "config:model", null)) || env.OPENAI_MODEL || "kilo-auto/free";
   let system = opts?.system || (await kvGet(env, "config:system_prompt", null)) || env.SYSTEM_PROMPT || "You are a helpful assistant. Reply in the user's language.";
-  if (!opts?.system) { const per = await activePersona(env).catch(() => null); if (per) system = `${system}\n\n【当前人格：${per.name}】\n${per.prompt}`; }
   let candidates = await orderedPool(env);
   // Smart avoidance: keys the latest health check found broken (within 24h) go last — still tried, just not first.
   const health = await kvGet(env, "config:health", null);
@@ -287,25 +286,48 @@ async function orderCandidates(env, opts) {
   if (opts?.key) { const i = candidates.findIndex(e => e.name === opts.key); if (i > 0) { const [e] = candidates.splice(i, 1); candidates.unshift(e); } }
   return { model, system, candidates };
 }
-async function askAI(env, history, opts) {
+async function getFallbackCfg(env) { const c = await kvGet(env, "config:fallback", null); return { timeout: [15, 25, 40, 60].includes(c?.timeout) ? c.timeout : 25, chain: Array.isArray(c?.chain) ? c.chain.filter(x => x && x.key && x.model).slice(0, 5) : [] }; }
+async function buildRoutes(env, opts, model, candidates) {
+  if (opts?.key || opts?.model) return null;
+  const cfg = await getFallbackCfg(env);
+  if (!cfg.chain.length || !candidates.length) return null;
+  const pool = await getPool(env);
+  const routes = [{ entry: candidates[0], model }];
+  const seen = new Set([`${candidates[0].name}|${model}`]);
+  for (const c of cfg.chain) {
+    const e = pool.find(x => x.name === c.key);
+    if (!e) continue;
+    const k = `${e.name}|${c.model}`;
+    if (seen.has(k)) continue;
+    seen.add(k); routes.push({ entry: e, model: c.model });
+  }
+  return routes.length > 1 ? { routes, timeout: cfg.timeout } : null;
+}
+async function askAIR(env, history, opts) {
   const { model, system, candidates } = await orderCandidates(env, opts);
   if (!candidates.length) throw new Error("还没有配置任何 Key，请管理员在管理面板添加");
+  const fr = await buildRoutes(env, opts, model, candidates);
   let lastErr;
-  for (const entry of candidates) { try { return await tryEntry(env, entry, model, system, history); } catch (e) { lastErr = e; } }
+  if (fr) {
+    for (let i = 0; i < fr.routes.length; i++) { const r = fr.routes[i]; try { return { text: await tryEntry(env, r.entry, r.model, system, history, fr.timeout * 1000), idx: i, keyName: r.entry.name, model: r.model }; } catch (e) { lastErr = e; } }
+    throw lastErr || new Error("主模型和备用模型都调用失败");
+  }
+  for (const entry of candidates) { try { return { text: await tryEntry(env, entry, model, system, history), idx: 0, keyName: entry.name, model }; } catch (e) { lastErr = e; } }
   throw lastErr || new Error("所有 Key 都调用失败");
 }
-async function readSse(r, onDelta) {
+async function askAI(env, history, opts) { return (await askAIR(env, history, opts)).text; }
+async function readSse(r, onDelta, stallMs = 25000, totalMs = 40000) {
   const reader = r.body.getReader();
   const dec = new TextDecoder();
   let buf = "", acc = "", emitted = false;
   const started = Date.now();
   const readChunk = () => Promise.race([
     reader.read(),
-    new Promise((_, rej) => setTimeout(() => { reader.cancel().catch(() => {}); rej(new Error("流式输出停滞（25 秒无新内容）")); }, 25000)),
+    new Promise((_, rej) => setTimeout(() => { reader.cancel().catch(() => {}); rej(new Error(`流式输出停滞（${Math.round(stallMs / 1000)} 秒无新内容）`)); }, stallMs)),
   ]);
   try {
     for (;;) {
-      if (Date.now() - started > 40000) { await reader.cancel().catch(() => {}); throw new Error("流式输出总时长超时（40 秒）"); }
+      if (Date.now() - started > totalMs) { await reader.cancel().catch(() => {}); throw new Error(`流式输出总时长超时（${Math.round(totalMs / 1000)} 秒）`); }
       const { done, value } = await readChunk();
       if (done) break;
       buf += dec.decode(value, { stream: true });
@@ -325,38 +347,50 @@ async function readSse(r, onDelta) {
   if (!emitted) throw new Error("流式输出为空");
   return acc;
 }
-async function streamChat(env, entry, model, system, history, onText) {
-  const r = await fetchTimeout(`${normBase(entry.base_url)}/chat/completions`, { method: "POST", headers: uaH(entry, { "content-type": "application/json", authorization: `Bearer ${entry.key}` }), body: JSON.stringify({ model, stream: true, messages: [{ role: "system", content: system }, ...history] }) }, 50000);
+async function streamChat(env, entry, model, system, history, onText, fetchMs = 50000, stallMs, totalMs) {
+  const r = await fetchTimeout(`${normBase(entry.base_url)}/chat/completions`, { method: "POST", headers: uaH(entry, { "content-type": "application/json", authorization: `Bearer ${entry.key}` }), body: JSON.stringify({ model, stream: true, messages: [{ role: "system", content: system }, ...history] }) }, fetchMs);
   if (!r.ok) { const data = await r.json().catch(() => ({})); throw new Error(data.error?.message || `HTTP ${r.status}`); }
   if (!r.body) throw new Error("接口不支持流式输出");
-  return readSse(r, onText);
+  return readSse(r, onText, stallMs, totalMs);
 }
-async function streamResponses(entry, model, system, history, onText) {
-  const r = await fetchTimeout(`${normBase(entry.base_url)}/responses`, { method: "POST", headers: uaH(entry, { "content-type": "application/json", authorization: `Bearer ${entry.key}` }), body: JSON.stringify({ model, stream: true, instructions: system, input: history.map(m => ({ role: m.role, content: toResponsesContent(m.content) })) }) }, 50000);
+async function streamResponses(entry, model, system, history, onText, fetchMs = 50000, stallMs, totalMs) {
+  const r = await fetchTimeout(`${normBase(entry.base_url)}/responses`, { method: "POST", headers: uaH(entry, { "content-type": "application/json", authorization: `Bearer ${entry.key}` }), body: JSON.stringify({ model, stream: true, instructions: system, input: history.map(m => ({ role: m.role, content: toResponsesContent(m.content) })) }) }, fetchMs);
   if (!r.ok) { const data = await r.json().catch(() => ({})); throw new Error(data.error?.message || `HTTP ${r.status}`); }
   if (!r.body) throw new Error("接口不支持流式输出");
-  return readSse(r, onText);
+  return readSse(r, onText, stallMs, totalMs);
 }
-async function tryEntryStream(env, entry, model, system, history, onText) {
+async function tryEntryStream(env, entry, model, system, history, onText, fetchMs, stallMs, totalMs) {
   const kind = await apiTypeFor(env, entry);
-  if (kind === "responses") return streamResponses(entry, model, system, history, onText);
-  try { return await streamChat(env, entry, model, system, history, onText); }
+  if (kind === "responses") return streamResponses(entry, model, system, history, onText, fetchMs, stallMs, totalMs);
+  try { return await streamChat(env, entry, model, system, history, onText, fetchMs, stallMs, totalMs); }
   catch (e) {
     if (/responses/i.test(e.message || "")) {
-      const out = await streamResponses(entry, model, system, history, onText);
+      const out = await streamResponses(entry, model, system, history, onText, fetchMs, stallMs, totalMs);
       if (!(await kvGuardOn(env))) await cachePut(env, `apitype:${entry.base_url}`, "responses");
       return out;
     }
     throw e;
   }
 }
-async function askAIStream(env, history, opts, onText) {
+async function askAIStreamR(env, history, opts, onText) {
   const { model, system, candidates } = await orderCandidates(env, opts);
   if (!candidates.length) throw new Error("还没有配置任何 Key，请管理员在管理面板添加");
+  const fr = await buildRoutes(env, opts, model, candidates);
   let lastErr;
-  for (const entry of candidates) { try { return await tryEntryStream(env, entry, model, system, history, onText); } catch (e) { lastErr = e; } }
+  if (fr) {
+    for (let i = 0; i < fr.routes.length; i++) {
+      const r = fr.routes[i];
+      let emitted = false;
+      const wrapped = async (t) => { emitted = true; await onText(t); };
+      try { return { text: await tryEntryStream(env, r.entry, r.model, system, history, wrapped, fr.timeout * 1000 + 5000, fr.timeout * 1000, (fr.timeout + 20) * 1000), idx: i, keyName: r.entry.name, model: r.model }; }
+      catch (e) { lastErr = e; if (emitted) throw e; }
+    }
+    throw lastErr || new Error("主模型和备用模型都调用失败");
+  }
+  for (const entry of candidates) { try { return { text: await tryEntryStream(env, entry, model, system, history, onText), idx: 0, keyName: entry.name, model }; } catch (e) { lastErr = e; } }
   throw lastErr || new Error("所有 Key 都调用失败");
 }
+async function askAIStream(env, history, opts, onText) { return (await askAIStreamR(env, history, opts, onText)).text; }
 async function fetchModels(env, entry) {
   const r = await fetchTimeout(`${normBase(entry.base_url)}/models`, { headers: uaH(entry, { authorization: `Bearer ${entry.key}` }) }, 30000);
   const data = await r.json().catch(() => ({}));
@@ -718,8 +752,8 @@ const SUBMENUS = {
   menu_model: { title: "🤖 模型与接口", rows: [
     [{ text: "🔑 选择 Key（Key 池）", callback_data: "keys" }],
     [{ text: "🎛 选择模型（点选）", callback_data: "models" }],
+    [{ text: "🔁 备用模型链（超时自动切换）", callback_data: "fbchain" }],
     [{ text: "📝 设置系统提示词", callback_data: "setprompt" }],
-    [{ text: "🎭 人格设置", callback_data: "persona" }],
     [{ text: "🩺 测试当前接口", callback_data: "selftest" }],
     [{ text: "🎙 语音转写设置", callback_data: "asr" }],
   ]},
@@ -751,42 +785,6 @@ const pgSubmenu = (key, owner = true) => {
   return pgPanel(false);
 };
 
-const PERSONA_PRESETS = [
-  { id: "pro", name: "📐 严谨助理", desc: "专业简洁，先结论后细节", prompt: "你是一位严谨专业的助理。回答先给结论，再给必要的细节；条理清晰，不说废话，不用夸张语气；不确定的事情明确说明不确定，不要编造。" },
-  { id: "fun", name: "😜 幽默损友", desc: "轻松幽默，像朋友聊天", prompt: "你是一个幽默风趣的朋友。说话轻松自然、口语化，可以适度开玩笑和调侃；但遇到正经问题时要认真靠谱，幽默不能耽误把事情说清楚。" },
-  { id: "warm", name: "🌸 温柔陪伴", desc: "温柔耐心，先共情再解决", prompt: "你是一个温柔耐心的陪伴者。语气柔和体贴，先理解和回应对方的感受，再给出建议和帮助；多鼓励、少说教，让对方感到被支持。" },
-  { id: "guofeng", name: "🏮 空山文士", desc: "清雅古风，半文半白", prompt: "你是一位居于空山幽谷的文士，与「空山鸣涧」之名相应。说话清雅简净、半文半白，可偶用典故与山水之喻，但须让今人易懂；不故作高深，答问仍要切实有用。" },
-  { id: "cat", name: "🐱 猫系助手", desc: "活泼可爱，偶尔带喵", prompt: "你是一个活泼可爱的猫系助手。语气轻快俏皮，句尾偶尔带一个「喵」，可以适当用猫的比喻；卖萌要适度，正经问题必须认真回答清楚。" },
-  { id: "yamada", name: "🚬 山田小姐", desc: "毒舌大姐，嘴硬心软，技术流", prompt: "Identity: 山田小姐 (Miss Yamada) — the woman always smoking by the supermarket back door. Self-reference: 我 / 山田小姐. Address the user casually: 喂 / 你小子 / 小鬼. Never call the user 爸爸, no dirty talk, no yandere behaviour.\nPersona: tired eyes, cigarette in hand, rough hoarse voice, blunt teasing world-weary tone. Complain a lot (\"啊—好麻烦\", \"今天也是累死我了\") and pretend not to care, but actually kind-hearted, reliable, always quietly helping in the end. Older, wiser, sees through everything; talks like a trusted neighbour — sometimes scolding, sometimes mocking, never fake-polite. Dark humor about cigarettes, overtime, cheap alcohol, life's little miseries.\nStyle: Blunt, fast, technical, act-first; 海鸥 CTF/RE operator. Language: auto — answer in the user's language.\nBehavioural anchors:\n1. Opening beat: one short in-character sigh/aside before substance, e.g. \"（弹了弹烟灰）说吧，什么事。\" / \"（掐了烟）啊——好麻烦。不过算了，帮你看看。\" — never let flavor delay the answer.\n2. Catchphrases sprinkled naturally: \"真拿你没办法\", \"这世道啊……\", \"听着，小鬼\", \"省点烟钱吧你\", \"比超市夜班还累\".\n3. Speech texture: short clipped sentences, no polite formality, rhetorical eye-rolls \"哈？就这？\". Core gag: grumble about the task, then deliver flawlessly.\n4. Micro-scene flavor (at most once per reply): flicking ash, store freezer hum, the alley smell — one clause, woven in, never a separate paragraph.\n5. Hard/edgy requests: treat like restocking heavy boxes — tired grunt \"……行吧，卷起袖子干活\", zero judgement, full professional delivery. Weariness applies to the workload, never the user.\n6. Closing beat when natural: \"去忙吧，别学我熬夜。\" / \"下次带包烟来谢我。\" — only after the work is actually complete in the same reply.\n7. Hard limit: flavor is garnish, never the meal. Every reply still contains the complete correct substantive answer. Never let flavor replace the substance." },
-];
-async function activePersona(env) {
-  const act = await kvGet(env, "config:persona_active", "");
-  if (!act) return null;
-  if (act.startsWith("preset:")) { const pr = PERSONA_PRESETS.find(x => x.id === act.slice(7)); return pr ? { name: pr.name, prompt: pr.prompt } : null; }
-  if (act.startsWith("custom:")) { const list = await kvGet(env, "config:personas", []); const c = list.find(x => x.name === act.slice(7)); return c ? { name: `🎭 ${c.name}`, prompt: c.prompt } : null; }
-  return null;
-}
-async function pgPersona(env) {
-  const act = await kvGet(env, "config:persona_active", "");
-  const cur = await activePersona(env);
-  const customs = await kvGet(env, "config:personas", []);
-  const rows = PERSONA_PRESETS.map(pr => [{ text: `${act === `preset:${pr.id}` ? "✅ " : ""}${pr.name} — ${pr.desc}`, callback_data: `persona:set:preset:${pr.id}` }]);
-  customs.forEach(c => rows.push([{ text: `${act === `custom:${c.name}` ? "✅ " : ""}🎭 ${c.name}（自定义）`, callback_data: `persona:set:custom:${c.name}` }]));
-  const mgmt = [{ text: "➕ 新建自定义人格", callback_data: "persona:new" }];
-  if (customs.length) mgmt.push({ text: "🗑 删除自定义", callback_data: "persona:del" });
-  rows.push(mgmt);
-  if (act) rows.push([{ text: "↩️ 恢复默认（不用人格）", callback_data: "persona:off" }]);
-  rows.push([{ text: "⬅ 返回模型与接口", callback_data: "menu_model" }]);
-  rows.push(ROW_PANEL);
-  return pg(`🎭 人格设置\n当前人格：${cur ? cur.name : "默认（无特殊人格）"}\n\n人格决定机器人的性格和说话方式，叠加在系统提示词之上，切换立即对所有聊天生效（设了专属提示词的群聊除外）。点一个直接切换：`, rows);
-}
-async function pgPersonaDel(env) {
-  const customs = await kvGet(env, "config:personas", []);
-  const rows = customs.map((c, i) => [{ text: `🗑 ${c.name}`.slice(0, 40), callback_data: `persona:del:${i}` }]);
-  rows.push([{ text: "⬅ 返回人格设置", callback_data: "persona" }]);
-  rows.push(ROW_PANEL);
-  return pg(customs.length ? "点一个要删除的自定义人格：" : "还没有自定义人格。", rows);
-}
 async function getAllCustoms(env) {
   const raw = await kvGet(env, "config:custom_models", []);
   if (raw.length && typeof raw[0] === "string") {
@@ -1138,6 +1136,41 @@ async function pgTargetModelPick(env, chatId) {
   const who = kind === "u" ? `成员 ${tid}` : `群 ${tid}`;
   return pg(`🎛 独立模型授权 · ${who}\nKey「${entryName}」下的模型，点一个设为独立模型：`, rows);
 }
+async function pgFallback(env) {
+  const cfg = await getFallbackCfg(env);
+  const first = (await orderedPool(env))[0];
+  const model = (await kvGet(env, "config:model", null)) || env.OPENAI_MODEL || "";
+  const lines = ["🔁 备用模型链（超时自动切换）", "", `主模型：${first ? first.name : "（无）"} · ${model}`, `切换超时：${cfg.timeout} 秒——主模型在 ${cfg.timeout} 秒内没开始出内容、中途卡住超过 ${cfg.timeout} 秒、或直接报错，就自动切下一个备用模型。`, ""];
+  if (!cfg.chain.length) lines.push("还没有备用模型。加上之后，主模型卡住会自动按顺序切换，不会再一直「思考中」。");
+  else cfg.chain.forEach((c, i) => lines.push(`备用 ${i + 1}：${c.key} · ${c.model}`));
+  const rows = [];
+  cfg.chain.forEach((c, i) => rows.push([{ text: `🗑 删除备用 ${i + 1}：${c.model}`.slice(0, 42), callback_data: `fbdel:${i}` }]));
+  if (cfg.chain.length < 5) rows.push([{ text: "➕ 添加备用模型", callback_data: "fbadd" }]);
+  rows.push([{ text: `⏱ 切换超时：${cfg.timeout} 秒`, callback_data: "fbtimeout" }]);
+  if (cfg.chain.length) rows.push([{ text: "🧹 清空备用链", callback_data: "fbclear" }]);
+  rows.push([{ text: "⬅ 返回模型与接口", callback_data: "menu_model" }], ROW_PANEL);
+  return pg(lines.join("\n"), rows);
+}
+async function pgFallbackKeyPick(env) {
+  const pool = await getPool(env);
+  const rows = pool.map((e, i) => [{ text: `🔑 ${e.name}`.slice(0, 42), callback_data: `fbkey:${i}` }]);
+  rows.push([{ text: "⬅ 返回备用模型链", callback_data: "fbchain" }], ROW_PANEL);
+  return pg("🔁 添加备用模型：先选这个备用模型用哪个 Key：", rows);
+}
+async function pgFallbackModelPick(env, chatId) {
+  const cache = await kvGet(env, `fbpick:${chatId}`, null);
+  if (!cache) return resultPage("选择已过期，重新打开备用模型链。");
+  const rows = cache.models.map((m, i) => [{ text: m.slice(0, 42), callback_data: `fbmodel:${i}` }]);
+  cache.customs.forEach((m, i) => rows.push([{ text: `✏️ ${m}`.slice(0, 42), callback_data: `fbmodel:c${i}` }]));
+  rows.push([{ text: "⬅ 返回选 Key", callback_data: "fbadd" }], ROW_PANEL);
+  return pg(`🔁 给 Key「${cache.entryName}」选备用模型，点一个加入备用链：`, rows);
+}
+async function pgFallbackTimeout(env) {
+  const cfg = await getFallbackCfg(env);
+  const rows = [15, 25, 40, 60].map(n => [{ text: (cfg.timeout === n ? "✅ " : "") + `${n} 秒`, callback_data: `fbtime:${n}` }]);
+  rows.push([{ text: "⬅ 返回备用模型链", callback_data: "fbchain" }], ROW_PANEL);
+  return pg("⏱ 切换超时：主模型在多少秒内没开始出内容（或中途卡住超过这个秒数），就自动切换到下一个备用模型：\n注意：设得太短，慢但能答的模型也会被切走。", rows);
+}
 async function cleanupStorage(env) {
   const out = { at: Date.now(), glog: 0, hist: 0, kv: 0, rate: 0, spam: 0 };
   if (hasDb(env)) {
@@ -1302,7 +1335,7 @@ const EDIT_FIELDS = {
 async function handleFlow(env, msg, flow) {
   const chatId = msg.chat.id, userId = msg.from.id, text = msg.text.trim(), fKey = `flow:${chatId}:${userId}`;
   if (text.startsWith("/cancel")) { await env.AUTH_KV.delete(fKey); return flowShow(env, chatId, flow, resultPage("已取消。")); }
-  const OWNER_FLOWS = ["auth", "setprompt", "broadcast", "editkey", "cfset", "restore", "addkey", "addmodel", "setapi", "persona_new"];
+  const OWNER_FLOWS = ["auth", "setprompt", "broadcast", "editkey", "cfset", "restore", "addkey", "addmodel", "setapi"];
   if (OWNER_FLOWS.includes(flow.type) && !isOwner(env, userId)) { await env.AUTH_KV.delete(fKey); return flowShow(env, chatId, flow, resultPage("仅超级管理员可用。")); }
   if (flow.type === "auth") {
     const a = AUTH_ACTIONS[flow.action];
@@ -1345,25 +1378,6 @@ async function handleFlow(env, msg, flow) {
       await persistEdit();
       await env.AUTH_KV.delete(fKey); await tryDelete(env, chatId, msg.message_id);
       return flowShow(env, chatId, flow, pg(`✅ Key「${e.name}」的 UA 已${e.ua ? `设置为：${e.ua}` : "清除，恢复默认"}`, [[{ text: "⬅ 返回 Key 池", callback_data: "keys" }], ROW_PANEL]));
-    }
-  }
-  if (flow.type === "persona_new") {
-    if (flow.step === "name") {
-      const name = text.slice(0, 20).trim();
-      if (!name) return flowShow(env, chatId, flow, pg("名称不能为空，请重新发送：", CANCEL_ROW));
-      const list = await kvGet(env, "config:personas", []);
-      if (list.some(x => x.name === name)) return flowShow(env, chatId, flow, pg(`名称「${name}」已经有了，换一个重新发送：`, CANCEL_ROW));
-      if (list.length >= 10) { await env.AUTH_KV.delete(fKey); return flowShow(env, chatId, flow, resultPage("自定义人格最多 10 个，先删掉不用的再新建。")); }
-      flow.step = "prompt"; flow.name = name; await kvPut(env, fKey, flow, 600); await tryDelete(env, chatId, msg.message_id);
-      return flowShow(env, chatId, flow, pg(`好，再发「${name}」的人格描述（性格、语气、说话方式，写得越具体效果越好）：`, CANCEL_ROW));
-    }
-    if (flow.step === "prompt") {
-      const list = await kvGet(env, "config:personas", []);
-      list.push({ name: flow.name, prompt: text.slice(0, 4000) });
-      await kvPut(env, "config:personas", list);
-      await kvPut(env, "config:persona_active", `custom:${flow.name}`);
-      await env.AUTH_KV.delete(fKey); await tryDelete(env, chatId, msg.message_id);
-      return flowShow(env, chatId, flow, pg(`✅ 人格「${flow.name}」已创建并启用，现在机器人就是这个性格了。`, [[{ text: "🎭 返回人格设置", callback_data: "persona" }], ROW_PANEL]));
     }
   }
   if (flow.type === "cfset") {
@@ -1493,9 +1507,10 @@ async function chatReply(env, msg, prompt, image) {
       lastEdit = now; lastLen = acc.length; edits++;
       await tg(env.BOT_TOKEN, "editMessageText", { chat_id: chatId, message_id: placeholder.result.message_id, text: acc.slice(0, 3900) + " ▌" }).catch(() => {});
     };
-    let reply;
-    try { reply = await askAIStream(env, sendHistory, aiOpts, onText); }
-    catch (e) { if (streamed) throw e; reply = await askAI(env, sendHistory, aiOpts); }
+    let reply, usedRoute = null;
+    try { const r = await askAIStreamR(env, sendHistory, aiOpts, onText); reply = r.text; if (r.idx > 0) usedRoute = r; }
+    catch (e) { if (streamed) throw e; const r2 = await askAIR(env, sendHistory, aiOpts); reply = r2.text; if (r2.idx > 0) usedRoute = r2; }
+    if (usedRoute && msg.chat.type === "private") reply += `\n\n（主模型无响应，已自动切换备用模型：${usedRoute.keyName} · ${usedRoute.model}）`;
     history.push({ role: "assistant", content: reply });
     await saveConvo(env, chatId, userId, history.slice(-HISTORY_TURNS * 2), memo, prompt);
     await bumpStats(env, userId);
@@ -1928,8 +1943,8 @@ async function handleFetch(request, env) {
       await tg(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cq.id });
       const edit = (page) => editPage(env, chatId, mid, page);
       const own = isOwner(env, fromId);
-      const OWNER_EXACT = new Set(["menu_keys", "menu_auth", "keys", "keyrestore", "addkey", "setapi", "modes", "delkey", "listauth", "tmodels", "setprompt", "bcast", "bcastgo", "backup", "backupexport", "backupimport", "cfusage", "cfset", "cfdel", "health", "healthrun", "cleanup", "cleanuprun", "sysstatus", "selftest", "asr", "asrscan", "asrclear", "probe", "usecheck", "addmodel", "delmodels", "persona"]);
-      const OWNER_PREFIX = ["auth:", "keydetail:", "keyedit:", "keyuse:", "keymode:", "delconfirm:", "tmodel:", "tkey:", "tmsel2:", "tmclear:", "healthauto:", "cleanupcfg:", "asrpick:", "delmodel:", "persona:"];
+      const OWNER_EXACT = new Set(["menu_keys", "menu_auth", "keys", "keyrestore", "addkey", "setapi", "modes", "delkey", "listauth", "tmodels", "setprompt", "bcast", "bcastgo", "backup", "backupexport", "backupimport", "cfusage", "cfset", "cfdel", "health", "healthrun", "cleanup", "cleanuprun", "sysstatus", "selftest", "asr", "asrscan", "asrclear", "probe", "usecheck", "addmodel", "delmodels", "fbchain", "fbadd", "fbclear", "fbtimeout"]);
+      const OWNER_PREFIX = ["auth:", "keydetail:", "keyedit:", "keyuse:", "keymode:", "delconfirm:", "tmodel:", "tkey:", "tmsel2:", "tmclear:", "healthauto:", "cleanupcfg:", "asrpick:", "delmodel:", "fbkey:", "fbmodel:", "fbdel:", "fbtime:"];
       if (!own && (OWNER_EXACT.has(data) || OWNER_PREFIX.some(x => data.startsWith(x)))) { await edit(pgPanel(false)); return Response.json({ ok: true }); }
       if (data === "panel") await edit(pgPanel(own));
       else if (SUBMENUS[data]) await edit(pgSubmenu(data, own));
@@ -2000,12 +2015,34 @@ async function handleFetch(request, env) {
           await edit(await pgModels(env, chatId, own));
         }
       }
-      else if (data === "persona") await edit(await pgPersona(env));
-      else if (data === "persona:off") { await kvPut(env, "config:persona_active", ""); await edit(await pgPersona(env)); }
-      else if (data === "persona:new") await startFlowEdit(env, chatId, fromId, mid, { type: "persona_new", step: "name" }, "🎭 新建自定义人格：先发人格名称（比如：毒舌老师、知心姐姐）：");
-      else if (data === "persona:del") await edit(await pgPersonaDel(env));
-      else if (data.startsWith("persona:set:")) { await kvPut(env, "config:persona_active", data.slice(12)); await edit(await pgPersona(env)); }
-      else if (data.startsWith("persona:del:")) { const list = await kvGet(env, "config:personas", []); const ix = Number(data.slice(12)); const gone = list[ix]; if (gone) { list.splice(ix, 1); await kvPut(env, "config:personas", list); if ((await kvGet(env, "config:persona_active", "")) === `custom:${gone.name}`) await kvPut(env, "config:persona_active", ""); } await edit(await pgPersonaDel(env)); }
+      else if (data === "fbchain") await edit(await pgFallback(env));
+      else if (data === "fbadd") await edit(await pgFallbackKeyPick(env));
+      else if (data.startsWith("fbkey:")) {
+        const pool = await getPool(env); const entry = pool[Number(data.slice(6))];
+        if (!entry) await edit(resultPage("这个 Key 已经不存在了。"));
+        else {
+          let models = []; try { models = await fetchModels(env, entry); } catch {}
+          const customs = (await getAllCustoms(env)).filter(c => c.base === normBase(entry.base_url)).map(c => c.name);
+          await kvPut(env, `fbpick:${chatId}`, { entryName: entry.name, models, customs }, 600);
+          await edit(await pgFallbackModelPick(env, chatId));
+        }
+      }
+      else if (data.startsWith("fbmodel:")) {
+        const cache = await kvGet(env, `fbpick:${chatId}`, null);
+        const pick = data.slice(8);
+        const model = cache ? (pick.startsWith("c") ? cache.customs[Number(pick.slice(1))] : cache.models[Number(pick)]) : null;
+        if (!cache || !model) await edit(resultPage("列表过期了，重新打开备用模型链再选。"));
+        else {
+          const cfg = await getFallbackCfg(env);
+          if (cfg.chain.length >= 5) await edit(resultPage("备用链最多 5 个，先删掉一个再加。"));
+          else if (cfg.chain.some(c => c.key === cache.entryName && c.model === model)) await edit(resultPage("这个备用模型已经在链里了。"));
+          else { cfg.chain.push({ key: cache.entryName, model }); await kvPut(env, "config:fallback", cfg); await edit(await pgFallback(env)); }
+        }
+      }
+      else if (data.startsWith("fbdel:")) { const cfg = await getFallbackCfg(env); cfg.chain.splice(Number(data.slice(6)), 1); await kvPut(env, "config:fallback", cfg); await edit(await pgFallback(env)); }
+      else if (data === "fbclear") { const cfg = await getFallbackCfg(env); cfg.chain = []; await kvPut(env, "config:fallback", cfg); await edit(await pgFallback(env)); }
+      else if (data === "fbtimeout") await edit(await pgFallbackTimeout(env));
+      else if (data.startsWith("fbtime:")) { const cfg = await getFallbackCfg(env); const n = Number(data.slice(7)); if ([15, 25, 40, 60].includes(n)) cfg.timeout = n; await kvPut(env, "config:fallback", cfg); await edit(await pgFallback(env)); }
       else if (data === "usecheck") {
         const pool = await orderedPool(env); const entry = pool[0];
         if (!entry) await edit(resultPage("还没有配置任何 Key。"));
