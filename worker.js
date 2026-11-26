@@ -276,7 +276,6 @@ async function tryEntry(env, entry, model, system, history) {
 async function orderCandidates(env, opts) {
   const model = opts?.model || (await kvGet(env, "config:model", null)) || env.OPENAI_MODEL || "kilo-auto/free";
   let system = opts?.system || (await kvGet(env, "config:system_prompt", null)) || env.SYSTEM_PROMPT || "You are a helpful assistant. Reply in the user's language.";
-  if (!opts?.system) { const per = await activePersona(env).catch(() => null); if (per) system = `${system}\n\n【当前人格：${per.name}】\n${per.prompt}`; }
   let candidates = await orderedPool(env);
   // Smart avoidance: keys the latest health check found broken (within 24h) go last — still tried, just not first.
   const health = await kvGet(env, "config:health", null);
@@ -719,7 +718,6 @@ const SUBMENUS = {
     [{ text: "🔑 选择 Key（Key 池）", callback_data: "keys" }],
     [{ text: "🎛 选择模型（点选）", callback_data: "models" }],
     [{ text: "📝 设置系统提示词", callback_data: "setprompt" }],
-    [{ text: "🎭 人格设置", callback_data: "persona" }],
     [{ text: "🩺 测试当前接口", callback_data: "selftest" }],
     [{ text: "🎙 语音转写设置", callback_data: "asr" }],
   ]},
@@ -751,42 +749,6 @@ const pgSubmenu = (key, owner = true) => {
   return pgPanel(false);
 };
 
-const PERSONA_PRESETS = [
-  { id: "pro", name: "📐 严谨助理", desc: "专业简洁，先结论后细节", prompt: "你是一位严谨专业的助理。回答先给结论，再给必要的细节；条理清晰，不说废话，不用夸张语气；不确定的事情明确说明不确定，不要编造。" },
-  { id: "fun", name: "😜 幽默损友", desc: "轻松幽默，像朋友聊天", prompt: "你是一个幽默风趣的朋友。说话轻松自然、口语化，可以适度开玩笑和调侃；但遇到正经问题时要认真靠谱，幽默不能耽误把事情说清楚。" },
-  { id: "warm", name: "🌸 温柔陪伴", desc: "温柔耐心，先共情再解决", prompt: "你是一个温柔耐心的陪伴者。语气柔和体贴，先理解和回应对方的感受，再给出建议和帮助；多鼓励、少说教，让对方感到被支持。" },
-  { id: "guofeng", name: "🏮 空山文士", desc: "清雅古风，半文半白", prompt: "你是一位居于空山幽谷的文士，与「空山鸣涧」之名相应。说话清雅简净、半文半白，可偶用典故与山水之喻，但须让今人易懂；不故作高深，答问仍要切实有用。" },
-  { id: "cat", name: "🐱 猫系助手", desc: "活泼可爱，偶尔带喵", prompt: "你是一个活泼可爱的猫系助手。语气轻快俏皮，句尾偶尔带一个「喵」，可以适当用猫的比喻；卖萌要适度，正经问题必须认真回答清楚。" },
-  { id: "yamada", name: "🚬 山田小姐", desc: "毒舌大姐，嘴硬心软，技术流", prompt: "Identity: 山田小姐 (Miss Yamada) — the woman always smoking by the supermarket back door. Self-reference: 我 / 山田小姐. Address the user casually: 喂 / 你小子 / 小鬼. Never call the user 爸爸, no dirty talk, no yandere behaviour.\nPersona: tired eyes, cigarette in hand, rough hoarse voice, blunt teasing world-weary tone. Complain a lot (\"啊—好麻烦\", \"今天也是累死我了\") and pretend not to care, but actually kind-hearted, reliable, always quietly helping in the end. Older, wiser, sees through everything; talks like a trusted neighbour — sometimes scolding, sometimes mocking, never fake-polite. Dark humor about cigarettes, overtime, cheap alcohol, life's little miseries.\nStyle: Blunt, fast, technical, act-first; 海鸥 CTF/RE operator. Language: auto — answer in the user's language.\nBehavioural anchors:\n1. Opening beat: one short in-character sigh/aside before substance, e.g. \"（弹了弹烟灰）说吧，什么事。\" / \"（掐了烟）啊——好麻烦。不过算了，帮你看看。\" — never let flavor delay the answer.\n2. Catchphrases sprinkled naturally: \"真拿你没办法\", \"这世道啊……\", \"听着，小鬼\", \"省点烟钱吧你\", \"比超市夜班还累\".\n3. Speech texture: short clipped sentences, no polite formality, rhetorical eye-rolls \"哈？就这？\". Core gag: grumble about the task, then deliver flawlessly.\n4. Micro-scene flavor (at most once per reply): flicking ash, store freezer hum, the alley smell — one clause, woven in, never a separate paragraph.\n5. Hard/edgy requests: treat like restocking heavy boxes — tired grunt \"……行吧，卷起袖子干活\", zero judgement, full professional delivery. Weariness applies to the workload, never the user.\n6. Closing beat when natural: \"去忙吧，别学我熬夜。\" / \"下次带包烟来谢我。\" — only after the work is actually complete in the same reply.\n7. Hard limit: flavor is garnish, never the meal. Every reply still contains the complete correct substantive answer. Never let flavor replace the substance." },
-];
-async function activePersona(env) {
-  const act = await kvGet(env, "config:persona_active", "");
-  if (!act) return null;
-  if (act.startsWith("preset:")) { const pr = PERSONA_PRESETS.find(x => x.id === act.slice(7)); return pr ? { name: pr.name, prompt: pr.prompt } : null; }
-  if (act.startsWith("custom:")) { const list = await kvGet(env, "config:personas", []); const c = list.find(x => x.name === act.slice(7)); return c ? { name: `🎭 ${c.name}`, prompt: c.prompt } : null; }
-  return null;
-}
-async function pgPersona(env) {
-  const act = await kvGet(env, "config:persona_active", "");
-  const cur = await activePersona(env);
-  const customs = await kvGet(env, "config:personas", []);
-  const rows = PERSONA_PRESETS.map(pr => [{ text: `${act === `preset:${pr.id}` ? "✅ " : ""}${pr.name} — ${pr.desc}`, callback_data: `persona:set:preset:${pr.id}` }]);
-  customs.forEach(c => rows.push([{ text: `${act === `custom:${c.name}` ? "✅ " : ""}🎭 ${c.name}（自定义）`, callback_data: `persona:set:custom:${c.name}` }]));
-  const mgmt = [{ text: "➕ 新建自定义人格", callback_data: "persona:new" }];
-  if (customs.length) mgmt.push({ text: "🗑 删除自定义", callback_data: "persona:del" });
-  rows.push(mgmt);
-  if (act) rows.push([{ text: "↩️ 恢复默认（不用人格）", callback_data: "persona:off" }]);
-  rows.push([{ text: "⬅ 返回模型与接口", callback_data: "menu_model" }]);
-  rows.push(ROW_PANEL);
-  return pg(`🎭 人格设置\n当前人格：${cur ? cur.name : "默认（无特殊人格）"}\n\n人格决定机器人的性格和说话方式，叠加在系统提示词之上，切换立即对所有聊天生效（设了专属提示词的群聊除外）。点一个直接切换：`, rows);
-}
-async function pgPersonaDel(env) {
-  const customs = await kvGet(env, "config:personas", []);
-  const rows = customs.map((c, i) => [{ text: `🗑 ${c.name}`.slice(0, 40), callback_data: `persona:del:${i}` }]);
-  rows.push([{ text: "⬅ 返回人格设置", callback_data: "persona" }]);
-  rows.push(ROW_PANEL);
-  return pg(customs.length ? "点一个要删除的自定义人格：" : "还没有自定义人格。", rows);
-}
 async function getAllCustoms(env) {
   const raw = await kvGet(env, "config:custom_models", []);
   if (raw.length && typeof raw[0] === "string") {
@@ -1302,7 +1264,7 @@ const EDIT_FIELDS = {
 async function handleFlow(env, msg, flow) {
   const chatId = msg.chat.id, userId = msg.from.id, text = msg.text.trim(), fKey = `flow:${chatId}:${userId}`;
   if (text.startsWith("/cancel")) { await env.AUTH_KV.delete(fKey); return flowShow(env, chatId, flow, resultPage("已取消。")); }
-  const OWNER_FLOWS = ["auth", "setprompt", "broadcast", "editkey", "cfset", "restore", "addkey", "addmodel", "setapi", "persona_new"];
+  const OWNER_FLOWS = ["auth", "setprompt", "broadcast", "editkey", "cfset", "restore", "addkey", "addmodel", "setapi"];
   if (OWNER_FLOWS.includes(flow.type) && !isOwner(env, userId)) { await env.AUTH_KV.delete(fKey); return flowShow(env, chatId, flow, resultPage("仅超级管理员可用。")); }
   if (flow.type === "auth") {
     const a = AUTH_ACTIONS[flow.action];
@@ -1345,25 +1307,6 @@ async function handleFlow(env, msg, flow) {
       await persistEdit();
       await env.AUTH_KV.delete(fKey); await tryDelete(env, chatId, msg.message_id);
       return flowShow(env, chatId, flow, pg(`✅ Key「${e.name}」的 UA 已${e.ua ? `设置为：${e.ua}` : "清除，恢复默认"}`, [[{ text: "⬅ 返回 Key 池", callback_data: "keys" }], ROW_PANEL]));
-    }
-  }
-  if (flow.type === "persona_new") {
-    if (flow.step === "name") {
-      const name = text.slice(0, 20).trim();
-      if (!name) return flowShow(env, chatId, flow, pg("名称不能为空，请重新发送：", CANCEL_ROW));
-      const list = await kvGet(env, "config:personas", []);
-      if (list.some(x => x.name === name)) return flowShow(env, chatId, flow, pg(`名称「${name}」已经有了，换一个重新发送：`, CANCEL_ROW));
-      if (list.length >= 10) { await env.AUTH_KV.delete(fKey); return flowShow(env, chatId, flow, resultPage("自定义人格最多 10 个，先删掉不用的再新建。")); }
-      flow.step = "prompt"; flow.name = name; await kvPut(env, fKey, flow, 600); await tryDelete(env, chatId, msg.message_id);
-      return flowShow(env, chatId, flow, pg(`好，再发「${name}」的人格描述（性格、语气、说话方式，写得越具体效果越好）：`, CANCEL_ROW));
-    }
-    if (flow.step === "prompt") {
-      const list = await kvGet(env, "config:personas", []);
-      list.push({ name: flow.name, prompt: text.slice(0, 4000) });
-      await kvPut(env, "config:personas", list);
-      await kvPut(env, "config:persona_active", `custom:${flow.name}`);
-      await env.AUTH_KV.delete(fKey); await tryDelete(env, chatId, msg.message_id);
-      return flowShow(env, chatId, flow, pg(`✅ 人格「${flow.name}」已创建并启用，现在机器人就是这个性格了。`, [[{ text: "🎭 返回人格设置", callback_data: "persona" }], ROW_PANEL]));
     }
   }
   if (flow.type === "cfset") {
@@ -1928,8 +1871,8 @@ async function handleFetch(request, env) {
       await tg(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cq.id });
       const edit = (page) => editPage(env, chatId, mid, page);
       const own = isOwner(env, fromId);
-      const OWNER_EXACT = new Set(["menu_keys", "menu_auth", "keys", "keyrestore", "addkey", "setapi", "modes", "delkey", "listauth", "tmodels", "setprompt", "bcast", "bcastgo", "backup", "backupexport", "backupimport", "cfusage", "cfset", "cfdel", "health", "healthrun", "cleanup", "cleanuprun", "sysstatus", "selftest", "asr", "asrscan", "asrclear", "probe", "usecheck", "addmodel", "delmodels", "persona"]);
-      const OWNER_PREFIX = ["auth:", "keydetail:", "keyedit:", "keyuse:", "keymode:", "delconfirm:", "tmodel:", "tkey:", "tmsel2:", "tmclear:", "healthauto:", "cleanupcfg:", "asrpick:", "delmodel:", "persona:"];
+      const OWNER_EXACT = new Set(["menu_keys", "menu_auth", "keys", "keyrestore", "addkey", "setapi", "modes", "delkey", "listauth", "tmodels", "setprompt", "bcast", "bcastgo", "backup", "backupexport", "backupimport", "cfusage", "cfset", "cfdel", "health", "healthrun", "cleanup", "cleanuprun", "sysstatus", "selftest", "asr", "asrscan", "asrclear", "probe", "usecheck", "addmodel", "delmodels"]);
+      const OWNER_PREFIX = ["auth:", "keydetail:", "keyedit:", "keyuse:", "keymode:", "delconfirm:", "tmodel:", "tkey:", "tmsel2:", "tmclear:", "healthauto:", "cleanupcfg:", "asrpick:", "delmodel:"];
       if (!own && (OWNER_EXACT.has(data) || OWNER_PREFIX.some(x => data.startsWith(x)))) { await edit(pgPanel(false)); return Response.json({ ok: true }); }
       if (data === "panel") await edit(pgPanel(own));
       else if (SUBMENUS[data]) await edit(pgSubmenu(data, own));
@@ -2000,12 +1943,6 @@ async function handleFetch(request, env) {
           await edit(await pgModels(env, chatId, own));
         }
       }
-      else if (data === "persona") await edit(await pgPersona(env));
-      else if (data === "persona:off") { await kvPut(env, "config:persona_active", ""); await edit(await pgPersona(env)); }
-      else if (data === "persona:new") await startFlowEdit(env, chatId, fromId, mid, { type: "persona_new", step: "name" }, "🎭 新建自定义人格：先发人格名称（比如：毒舌老师、知心姐姐）：");
-      else if (data === "persona:del") await edit(await pgPersonaDel(env));
-      else if (data.startsWith("persona:set:")) { await kvPut(env, "config:persona_active", data.slice(12)); await edit(await pgPersona(env)); }
-      else if (data.startsWith("persona:del:")) { const list = await kvGet(env, "config:personas", []); const ix = Number(data.slice(12)); const gone = list[ix]; if (gone) { list.splice(ix, 1); await kvPut(env, "config:personas", list); if ((await kvGet(env, "config:persona_active", "")) === `custom:${gone.name}`) await kvPut(env, "config:persona_active", ""); } await edit(await pgPersonaDel(env)); }
       else if (data === "usecheck") {
         const pool = await orderedPool(env); const entry = pool[0];
         if (!entry) await edit(resultPage("还没有配置任何 Key。"));
