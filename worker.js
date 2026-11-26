@@ -288,19 +288,16 @@ async function orderCandidates(env, opts) {
 }
 async function getFallbackCfg(env) { const c = await kvGet(env, "config:fallback", null); return { timeout: [15, 25, 40, 60].includes(c?.timeout) ? c.timeout : 25, chain: Array.isArray(c?.chain) ? c.chain.filter(x => x && x.key && x.model).slice(0, 5) : [] }; }
 async function buildRoutes(env, opts, model, candidates) {
-  if (opts?.key || opts?.model) return null;
   const cfg = await getFallbackCfg(env);
-  if (!cfg.chain.length || !candidates.length) return null;
+  if (!cfg.chain.length && !opts?.rescue) return null;
+  if ((opts?.key || opts?.model) && !opts?.rescue) return null;
   const pool = await getPool(env);
-  const routes = [{ entry: candidates[0], model }];
-  const seen = new Set([`${candidates[0].name}|${model}`]);
-  for (const c of cfg.chain) {
-    const e = pool.find(x => x.name === c.key);
-    if (!e) continue;
-    const k = `${e.name}|${c.model}`;
-    if (seen.has(k)) continue;
-    seen.add(k); routes.push({ entry: e, model: c.model });
-  }
+  const routes = []; const seen = new Set();
+  const push = (entry, m) => { if (!entry || !m) return; const k = `${entry.name}|${m}`; if (seen.has(k)) return; seen.add(k); routes.push({ entry, model: m }); };
+  if (opts?.rescue) push(pool.find(x => x.name === opts.rescue.key), opts.rescue.model);
+  if (candidates.length) push(candidates[0], model);
+  for (const c of cfg.chain) push(pool.find(x => x.name === c.key), c.model);
+  if (opts?.rescue) return routes.length ? { routes, timeout: cfg.timeout } : null;
   return routes.length > 1 ? { routes, timeout: cfg.timeout } : null;
 }
 async function askAIR(env, history, opts) {
@@ -1305,7 +1302,7 @@ const ADMIN_HELP = [
   "• 状态与维护：系统状态、使用统计、群发通知",
   "• 隐私：管理功能只能在私聊用；Key 只打码显示；误发的密钥消息会被自动删除",
 ].join("\n");
-const USER_HELP = "❓ 使用说明\n• 直接发消息就能和我聊天，我会记住上下文\n• 发图片我也能看：把问题写在图片的说明文字里发给我（群里发图要在说明里 @我；需要当前模型支持视觉）\n• 发语音我也能听：我会先转成文字再回答（群里请用回复我的方式发语音）\n• 想画图用 /draw 加描述，比如 /draw 一只在太空里的猫；或者对我说「帮我画……」\n• 群里请 @我、回复我，或用 /ask 提问；回复别人的消息时 @我，我会结合被回复的内容回答；@我 说「总结」可直接选时间范围\n• 群功能（仅授权群）：/summary 选 1/6/12/24/48 小时让 AI 总结群消息；/search 关键词 检索群消息；/group 打开群功能菜单（总结、检索、活跃统计、自动总结）\n• 按钮可以查你的 ID、清空你自己的对话记忆\n• 你的对话只有你自己能看，密钥和管理信息只有管理员能看\n• 说明：授权群里机器人会记录最近的群消息（最多保留 72 小时）只用于总结和检索，密钥类消息永远不会被记录";
+const USER_HELP = "❓ 使用说明\n• 直接发消息就能和我聊天，我会记住上下文\n• 发图片我也能看：把问题写在图片的说明文字里发给我（群里发图要在说明里 @我；需要当前模型支持视觉）\n• 发语音我也能听：我会先转成文字再回答（群里请用回复我的方式发语音）\n• 想画图用 /draw 加描述，比如 /draw 一只在太空里的猫；或者对我说「帮我画……」\n• 群里请 @我、回复我，或用 /ask 提问；回复别人的消息时 @我，我会结合被回复的内容回答；@我 说「总结」可直接选时间范围\n• 群功能（仅授权群）：/summary 选 1/6/12/24/48 小时让 AI 总结群消息；/search 关键词 检索群消息；/group 打开群功能菜单（总结、检索、活跃统计、自动总结）\n• 回答卡住时发 /rescue：立即切换到备用模型重新回答，接下来 15 分钟也优先用备用模型（急救指令，优先级最高）\n• 按钮可以查你的 ID、清空你自己的对话记忆\n• 你的对话只有你自己能看，密钥和管理信息只有管理员能看\n• 说明：授权群里机器人会记录最近的群消息（最多保留 72 小时）只用于总结和检索，密钥类消息永远不会被记录";
 
 // ---------- Flows (prompt lives in the panel message and is edited in place) ----------
 const CANCEL_ROW = [[{ text: "⬅ 取消并返回", callback_data: "flowcancel" }]];
@@ -1472,13 +1469,34 @@ async function handleAdminCmd(env, msg, text) {
   return sendPage(env, chatId, resultPage(ADMIN_HELP));
 }
 
-// ---------- Chat (placeholder edited into the reply) ----------
+// ---------- Chat (reply sent when ready; /rescue for stuck chats) ----------
+async function doRescue(env, msg) {
+  const chatId = msg.chat.id, userId = msg.from.id;
+  const cfg = await getFallbackCfg(env);
+  const first = cfg.chain[0];
+  if (!first) { await sendTemp(env, chatId, "🚑 还没有装备用模型：先到管理面板 → 模型与接口 → 备用模型链里加一个，急救才能用。"); return; }
+  await kvPut(env, `rescue:${chatId}`, { key: first.key, model: first.model, until: Date.now() + 15 * 60 * 1000 }, 15 * 60);
+  const convo = await loadConvo(env, chatId, userId);
+  const hist = (convo.history || []).filter(m => typeof m.content === "string");
+  const lastMsg = hist[hist.length - 1];
+  if (lastMsg && lastMsg.role === "user") {
+    const q = String(lastMsg.content).replace(/^\[图片\]\s*/, "");
+    await sendTemp(env, chatId, `🚑 急救模式已开启（15 分钟内优先用备用模型：${first.key} · ${first.model}），正在用它重新回答你刚才的问题…`);
+    try {
+      const r = await askAIR(env, hist, { key: first.key, model: first.model });
+      hist.push({ role: "assistant", content: r.text });
+      await saveConvo(env, chatId, userId, hist.slice(-HISTORY_TURNS * 2), convo.memo, q);
+      await bumpStats(env, userId);
+      await send(env, chatId, `🚑 急救回答（${first.key} · ${first.model}）：\n${r.text}`);
+    } catch (e) { await send(env, chatId, `🚑 备用模型也没答出来${isOwner(env, userId) ? `：${e.message}` : "，请稍后再试。"}`); }
+  } else {
+    await sendTemp(env, chatId, `🚑 急救模式已开启：接下来 15 分钟优先用备用模型（${first.key} · ${first.model}）回答，不用再等主模型。`);
+  }
+}
 async function chatReply(env, msg, prompt, image) {
   const chatId = msg.chat.id, userId = msg.from.id;
   if (!(await rateOk(env, userId))) return sendTemp(env, chatId, "太频繁了，请稍等一分钟。");
   await setLast(env, chatId, userId, prompt);
-  const placeholder = await tg(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: image ? "🖼 正在看图…" : "⏳ 思考中…", ...(msg.chat.type !== "private" ? { reply_parameters: { message_id: msg.message_id } } : {}) });
-  if (placeholder.ok) await trackBotMsg(env, chatId, placeholder.result.message_id, 0);
   const convo = await loadConvo(env, chatId, userId);
   let history = convo.history, memo = convo.memo;
   history.push({ role: "user", content: image ? `[图片] ${prompt}` : prompt });
@@ -1497,43 +1515,36 @@ async function chatReply(env, msg, prompt, image) {
     let aiOpts;
     if (msg.chat.type !== "private") { const gcfg = await kvGet(env, `gcfg:${chatId}`, {}); if (gcfg.model || gcfg.prompt) aiOpts = { model: gcfg.model || undefined, key: gcfg.key || undefined, system: gcfg.prompt || undefined }; }
     else { const ucfg = await kvGet(env, `ucfg:${userId}`, {}); if (ucfg.model) aiOpts = { model: ucfg.model, key: ucfg.key || undefined }; }
-    let streamed = false, lastEdit = 0, lastLen = 0, edits = 0;
-    const onText = async (acc) => {
-      streamed = true;
-      if (!placeholder.ok || edits >= 35) return;
-      const now = Date.now();
-      if (now - lastEdit < 1200 && acc.length - lastLen < 200) return;
-      if (acc.length - lastLen < 30 && now - lastEdit < 3000) return;
-      lastEdit = now; lastLen = acc.length; edits++;
-      await tg(env.BOT_TOKEN, "editMessageText", { chat_id: chatId, message_id: placeholder.result.message_id, text: acc.slice(0, 3900) + " ▌" }).catch(() => {});
-    };
+    const rescueCfg = await kvGet(env, `rescue:${chatId}`, null);
+    if (rescueCfg && rescueCfg.until > Date.now() && rescueCfg.key && rescueCfg.model) aiOpts = { ...(aiOpts || {}), rescue: { key: rescueCfg.key, model: rescueCfg.model } };
+    let streamed = false;
+    const onText = async () => { streamed = true; };
     let reply, usedRoute = null;
     try { const r = await askAIStreamR(env, sendHistory, aiOpts, onText); reply = r.text; if (r.idx > 0) usedRoute = r; }
-    catch (e) { if (streamed) throw e; const r2 = await askAIR(env, sendHistory, aiOpts); reply = r2.text; if (r2.idx > 0) usedRoute = r2; }
+    catch (e) { const r2 = await askAIR(env, sendHistory, aiOpts); reply = r2.text; if (r2.idx > 0) usedRoute = r2; }
     if (usedRoute && msg.chat.type === "private") reply += `\n\n（主模型无响应，已自动切换备用模型：${usedRoute.keyName} · ${usedRoute.model}）`;
     history.push({ role: "assistant", content: reply });
     await saveConvo(env, chatId, userId, history.slice(-HISTORY_TURNS * 2), memo, prompt);
     await bumpStats(env, userId);
     const chunks = splitText(reply);
     const buttons = { inline_keyboard: [[{ text: "🔄 重新生成", callback_data: "regen" }, { text: "🧹 清空记忆", callback_data: "clearmine" }]] };
-    if (placeholder.ok) {
-      const mid = placeholder.result.message_id;
-      let done = false;
-      if (chunks.length === 1 && reply.length > 1500) {
-        const html = collapsibleHtml(reply);
-        if (html) { const r = await tg(env.BOT_TOKEN, "editMessageText", { chat_id: chatId, message_id: mid, text: html, parse_mode: "HTML", reply_markup: buttons }); done = !!r.ok; }
+    const quote = msg.chat.type !== "private" ? { reply_parameters: { message_id: msg.message_id } } : {};
+    let btnMid = null;
+    if (chunks.length === 1 && reply.length > 1500) {
+      const html = collapsibleHtml(reply);
+      if (html) { const r = await tg(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML", reply_markup: buttons, ...quote }); if (r.ok) { btnMid = r.result.message_id; await trackBotMsg(env, chatId, btnMid, 0); } }
+    }
+    if (!btnMid) {
+      for (let i = 0; i < chunks.length; i++) {
+        const r = await tg(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: chunks[i], ...(i === 0 ? quote : {}), ...(i === chunks.length - 1 ? { reply_markup: buttons } : {}) });
+        if (r.ok) { await trackBotMsg(env, chatId, r.result.message_id, 0); if (i === chunks.length - 1) btnMid = r.result.message_id; }
       }
-      if (!done) {
-        await tg(env.BOT_TOKEN, "editMessageText", { chat_id: chatId, message_id: mid, text: chunks[0], reply_markup: chunks.length === 1 ? buttons : { inline_keyboard: [] } });
-        for (let i = 1; i < chunks.length; i++) await send(env, chatId, chunks[i], i === chunks.length - 1 ? { reply_markup: buttons } : undefined);
-      }
-      await kvPut(env, `regenowner:${chatId}:${mid}`, String(userId), 60 * 60 * 6);
-    } else await send(env, chatId, reply);
+    }
+    if (btnMid) await kvPut(env, `regenowner:${chatId}:${btnMid}`, String(userId), 60 * 60 * 6);
   } catch (e) {
     const isAdm = isOwner(env, userId);
     const errText = isAdm ? `调用模型失败：${e.message}` : "调用失败，请稍后再试，或联系管理员。";
-    if (placeholder.ok) await tg(env.BOT_TOKEN, "editMessageText", { chat_id: chatId, message_id: placeholder.result.message_id, text: errText }).catch(async () => send(env, chatId, errText));
-    else await send(env, chatId, errText);
+    await send(env, chatId, errText);
   }
 }
 async function handlePhoto(env, msg) {
@@ -1719,7 +1730,7 @@ async function handleFetch(request, env) {
       const basic = [
         { command: "start", description: "开始使用" }, { command: "help", description: "查看帮助" },
         { command: "id", description: "查看我的ID" }, { command: "clear", description: "清空我的对话记忆" },
-        { command: "ask", description: "在群里向我提问" },
+        { command: "ask", description: "在群里向我提问" }, { command: "rescue", description: "🚑 急救：卡住时切备用模型重答" },
         { command: "draw", description: "画图，如 /draw 一只猫" },
       ];
       const groupCmds = [...basic,
@@ -2190,6 +2201,7 @@ async function handleFetch(request, env) {
     }
 
     if (!(await isAllowed(env, msg.chat, userId))) { await send(env, chatId, `未授权。请把你的 ID 发给管理员授权：${userId}` + (msg.chat.type !== "private" ? `\n群 ID：${chatId}` : "")); return Response.json({ ok: true }); }
+    if (cmd === "/rescue") { await doRescue(env, msg); await tryDelete(env, chatId, msg.message_id); return Response.json({ ok: true }); }
     if (cmd === "/clear") { await dbHistClear(env, chatId, userId); await sendTemp(env, chatId, "🧹 你自己的对话记忆已清空。"); await tryDelete(env, chatId, msg.message_id); return Response.json({ ok: true }); }
     if (msg.chat.type === "private") {
       const df = await kvGet(env, `drawflow:${chatId}:${userId}`, null);
