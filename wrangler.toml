@@ -1,0 +1,20 @@
+name = "openai-tg-bot"
+main = "worker.js"
+compatibility_date = "2024-11-30"
+
+[[kv_namespaces]]
+binding = "AUTH_KV"
+id = "改成你的KV命名空间ID"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "openai-tg-bot-db"
+database_id = "改成你的D1数据库ID"
+
+[triggers]
+crons = ["0 * * * *"]
+
+[vars]
+ADMIN_IDS = "改成你的Telegram数字ID"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_MODEL = "gpt-4o-mini"
